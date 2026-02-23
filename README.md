@@ -1,8 +1,12 @@
-# QMD - Query Markup Documents
+# QMD-MLX - Query Markup Documents with MLX
 
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+**QMD-MLX** is a fork of [qmd](https://github.com/tobi/qmd) that replaces GGUF models with Apple Silicon-optimized [MLX models](https://github.com/ml-explore/mlx) for 2-4x faster performance on Mac.
+
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally:
+- **Original**: Uses node-llama-cpp with GGUF models (cross-platform)
+- **MLX Backend** (this fork): Uses MLX Python backend with optimized models for Apple Silicon
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
@@ -246,15 +250,45 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
   brew install sqlite
   ```
 
-### GGUF Models (via node-llama-cpp)
+### MLX Models (Apple Silicon - Recommended)
 
-QMD uses three local GGUF models (auto-downloaded on first use):
+**This fork uses MLX models for 2-4x faster performance on Apple Silicon:**
+
+| Model | Purpose | Size |
+|-------|---------|------|
+| `mlx-community/embeddinggemma-300m-4bit` | Vector embeddings | ~300MB |
+| `mlx-community/Qwen3-Reranker-0.6B-mxfp8` | Re-ranking | ~640MB |
+| `mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit` | Query expansion | ~1GB |
+
+Models are downloaded from HuggingFace and cached in `~/.cache/huggingface/`.
+
+**Prerequisites:**
+- Apple Silicon Mac (M1/M2/M3/M4)
+- Python 3.9+
+- macOS 13.3 or later
+
+**Setup:**
+
+```bash
+# Install Python dependencies for MLX backend
+cd qmd-mlx
+pip install -r requirements.txt
+
+# Test the backend (will download models on first run)
+python3 test_mlx_backend.py
+```
+
+See [MLX_BACKEND.md](MLX_BACKEND.md) for detailed documentation.
+
+### GGUF Models (Cross-platform Fallback)
+
+The original GGUF backend is available as a fallback:
 
 | Model | Purpose | Size |
 |-------|---------|------|
 | `embeddinggemma-300M-Q8_0` | Vector embeddings | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
-| `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
+| `qmd-query-expansion-1.7B-q4_k_m` | Query expansion | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 

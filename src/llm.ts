@@ -1232,8 +1232,9 @@ export class LlamaMlx implements LLM {
     if (config.backendScript) {
       this.backendScript = config.backendScript;
     } else {
-      // Assume mlx_backend.py is in the project root (two levels up from src/llm.ts)
-      const projectRoot = join(__dirname, "..", "..");
+      // When built (dist/llm.js), __dirname is dist/, so go up one level to project root
+      // When in dev (src/llm.ts), __dirname is src/, also go up one level
+      const projectRoot = join(__dirname, "..");
       this.backendScript = join(projectRoot, "mlx_backend.py");
     }
     
