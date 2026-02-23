@@ -23,6 +23,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 import traceback
+import math
 
 # Configure logging to stderr
 logging.basicConfig(
@@ -41,6 +42,24 @@ GENERATE_MODEL = "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit"
 CACHE_DIR = Path.home() / ".cache" / "qmd" / "mlx-models"
 
 
+def _sanitize_for_json(obj):
+    """Recursively replace NaN/Inf with 0.0 for valid JSON."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
+        return obj
+    return obj
+
+
+def _json_dumps(obj):
+    """JSON serialize with NaN/Inf sanitization."""
+    return json.dumps(_sanitize_for_json(obj))
+
+
 class MLXBackend:
     """Manages MLX models and handles commands."""
     
@@ -52,47 +71,40 @@ class MLXBackend:
         self.generate_model = None
         self.generate_tokenizer = None
     
-    def _tokenize(self, tokenizer, texts):
-        """Tokenize texts, handling different tokenizer types."""
-        # Try to get the underlying tokenizer if wrapped
-        if hasattr(tokenizer, 'tokenizer'):
-            tok = tokenizer.tokenizer
-        elif hasattr(tokenizer, '_tokenizer'):
-            tok = tokenizer._tokenizer
-        else:
-            tok = tokenizer
-        
-        # Try different tokenization methods
-        try:
-            # Standard HuggingFace tokenizer API
-            if hasattr(tok, '__call__'):
-                return tok(texts, return_tensors="np", padding=True, truncation=True)
-        except Exception:
-            pass
-        
-        try:
-            # Try encode method
-            if hasattr(tok, 'encode'):
-                if isinstance(texts, list):
-                    encoded = [tok.encode(t) for t in texts]
-                    # Create attention mask and convert to dict format
-                    import numpy as np
-                    max_len = max(len(e) for e in encoded)
-                    padded = [e + [0] * (max_len - len(e)) for e in encoded]
-                    attention_mask = [[1] * len(e) + [0] * (max_len - len(e)) for e in encoded]
-                    return {
-                        'input_ids': np.array(padded, dtype=np.int32),
-                        'attention_mask': np.array(attention_mask, dtype=np.float16)
-                    }
-                else:
-                    encoded = tok.encode(texts)
-                    import numpy as np
-                    return {
-                        'input_ids': np.array([encoded], dtype=np.int32),
-                        'attention_mask': np.array([[1] * len(encoded)], dtype=np.float16)
-                    }
-        except Exception as e:
-            raise ValueError(f"Could not tokenize with available methods: {e}")
+    def _embed_texts(self, texts: List[str]) -> 'mx.array':
+        """Tokenize and embed texts using mlx_embeddings API.
+        Returns text_embeds (already mean-pooled and normalized) as mx.array of shape (N, dim)."""
+        import mlx.core as mx
+        from mlx_embeddings.utils import prepare_inputs
+
+        # Tokenize each text individually (batch_encode_plus is broken in some tokenizers)
+        all_ids = []
+        for t in texts:
+            inp = prepare_inputs(self.embed_tokenizer, None, t, 512, True, True)
+            if isinstance(inp, dict):
+                inp = mx.array(inp['input_ids']) if not isinstance(inp['input_ids'], mx.array) else inp['input_ids']
+            all_ids.append(inp)
+
+        # Pad to max length and build attention mask (float16 to match model dtype)
+        max_len = max(a.shape[1] for a in all_ids)
+        padded = []
+        masks = []
+        for a in all_ids:
+            pad_len = max_len - a.shape[1]
+            if pad_len > 0:
+                padded.append(mx.concatenate([a, mx.zeros((1, pad_len), dtype=a.dtype)], axis=1))
+                masks.append(mx.concatenate([mx.ones((1, a.shape[1]), dtype=mx.float16), mx.zeros((1, pad_len), dtype=mx.float16)], axis=1))
+            else:
+                padded.append(a)
+                masks.append(mx.ones((1, a.shape[1]), dtype=mx.float16))
+
+        input_ids = mx.concatenate(padded, axis=0)
+        attention_mask = mx.concatenate(masks, axis=0)
+
+        # Run model - returns BaseModelOutput with text_embeds (already pooled + normalized)
+        output = self.embed_model(input_ids, attention_mask=attention_mask)
+        return output.text_embeds
+
         
     def initialize(self) -> Dict[str, Any]:
         """Load all models. Returns status."""
@@ -158,41 +170,13 @@ class MLXBackend:
     def embed(self, text: str, is_query: bool = False, title: Optional[str] = None) -> Dict[str, Any]:
         """Generate embedding for a single text."""
         try:
-            import mlx.core as mx
-            
             # Format text with appropriate prefix (matching EmbeddingGemma format)
             if is_query:
                 formatted_text = f"task: search result | query: {text}"
             else:
                 formatted_text = f"title: {title or 'none'} | text: {text}"
-            
-            # Tokenize
-            inputs = self._tokenize(self.embed_tokenizer, [formatted_text])
-            
-            # Generate embedding - MLX models expect 'inputs' parameter
-            if 'input_ids' in inputs:
-                input_ids = mx.array(inputs['input_ids'])
-                # Pass attention_mask if available, ensuring it's float16
-                if 'attention_mask' in inputs:
-                    attention_mask = mx.array(inputs['attention_mask']).astype(mx.float16)
-                    output = self.embed_model(inputs=input_ids, attention_mask=attention_mask)
-                else:
-                    output = self.embed_model(inputs=input_ids)
-            else:
-                output = self.embed_model(**{k: mx.array(v) for k, v in inputs.items()})
-            
-            # Get embedding (mean pooling over sequence)
-            if hasattr(output, 'last_hidden_state'):
-                embeddings = output.last_hidden_state
-            elif hasattr(output, 'pooler_output'):
-                embeddings = output.pooler_output
-            else:
-                embeddings = output[0] if isinstance(output, tuple) else output
-            
-            # Mean pool and normalize
-            embedding = mx.mean(embeddings[0], axis=0)
-            embedding = embedding / mx.linalg.norm(embedding)
-            embedding_list = embedding.tolist()
+            text_embeds = self._embed_texts([formatted_text])
+            embedding_list = text_embeds[0].tolist()
             
             return {
                 "success": True,
@@ -203,12 +187,9 @@ class MLXBackend:
             logger.error(f"Embed error: {e}")
             logger.error(traceback.format_exc())
             return {"success": False, "error": str(e)}
-    
     def embed_batch(self, texts: List[str], is_query: bool = False, titles: Optional[List[str]] = None) -> Dict[str, Any]:
         """Generate embeddings for multiple texts."""
         try:
-            import mlx.core as mx
-            
             # Format texts with appropriate prefixes
             formatted_texts = []
             for i, text in enumerate(texts):
@@ -217,36 +198,8 @@ class MLXBackend:
                 else:
                     title = titles[i] if titles and i < len(titles) else "none"
                     formatted_texts.append(f"title: {title} | text: {text}")
-            
-            # Tokenize all texts
-            inputs = self._tokenize(self.embed_tokenizer, formatted_texts)
-            
-            # Generate embeddings - MLX models expect 'inputs' parameter
-            if 'input_ids' in inputs:
-                input_ids = mx.array(inputs['input_ids'])
-                # Pass attention_mask if available, ensuring it's float16
-                if 'attention_mask' in inputs:
-                    attention_mask = mx.array(inputs['attention_mask']).astype(mx.float16)
-                    output = self.embed_model(inputs=input_ids, attention_mask=attention_mask)
-                else:
-                    output = self.embed_model(inputs=input_ids)
-            else:
-                output = self.embed_model(**{k: mx.array(v) for k, v in inputs.items()})
-            
-            # Get embeddings
-            if hasattr(output, 'last_hidden_state'):
-                embeddings_mx = output.last_hidden_state
-            elif hasattr(output, 'pooler_output'):
-                embeddings_mx = output.pooler_output
-            else:
-                embeddings_mx = output[0] if isinstance(output, tuple) else output
-            
-            # Mean pool and normalize each embedding
-            embeddings = []
-            for i in range(len(formatted_texts)):
-                emb = mx.mean(embeddings_mx[i], axis=0)
-                emb = emb / mx.linalg.norm(emb)
-                embeddings.append(emb.tolist())
+            text_embeds = self._embed_texts(formatted_texts)
+            embeddings = [text_embeds[i].tolist() for i in range(text_embeds.shape[0])]
             
             return {
                 "success": True,
@@ -259,64 +212,19 @@ class MLXBackend:
             return {"success": False, "error": str(e)}
     
     def rerank(self, query: str, documents: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Rerank documents by relevance to query."""
+        """Rerank documents by relevance to query using embedding cosine similarity."""
         try:
             import mlx.core as mx
-            
-            # Embed query
             query_formatted = f"task: search result | query: {query}"
-            query_inputs = self._tokenize(self.embed_tokenizer, [query_formatted])
-            if 'input_ids' in query_inputs:
-                input_ids = mx.array(query_inputs['input_ids'])
-                # Pass attention_mask if available, ensuring it's float16
-                if 'attention_mask' in query_inputs:
-                    attention_mask = mx.array(query_inputs['attention_mask']).astype(mx.float16)
-                    query_output = self.embed_model(inputs=input_ids, attention_mask=attention_mask)
-                else:
-                    query_output = self.embed_model(inputs=input_ids)
-            else:
-                query_output = self.embed_model(**{k: mx.array(v) for k, v in query_inputs.items()})
-            
-            if hasattr(query_output, 'last_hidden_state'):
-                query_embeddings = query_output.last_hidden_state
-            elif hasattr(query_output, 'pooler_output'):
-                query_embeddings = query_output.pooler_output
-            else:
-                query_embeddings = query_output[0] if isinstance(query_output, tuple) else query_output
-            
-            query_emb = mx.mean(query_embeddings[0], axis=0)
-            query_emb = query_emb / mx.linalg.norm(query_emb)
-            
+            query_emb = self._embed_texts([query_formatted])  # shape (1, dim), already normalized
             # Embed documents
             doc_formatted = [f"title: {doc.get('title', 'none')} | text: {doc.get('text', '')}" for doc in documents]
-            doc_inputs = self._tokenize(self.embed_tokenizer, doc_formatted)
-            if 'input_ids' in doc_inputs:
-                input_ids = mx.array(doc_inputs['input_ids'])
-                # Pass attention_mask if available, ensuring it's float16
-                if 'attention_mask' in doc_inputs:
-                    attention_mask = mx.array(doc_inputs['attention_mask']).astype(mx.float16)
-                    doc_output = self.embed_model(inputs=input_ids, attention_mask=attention_mask)
-                else:
-                    doc_output = self.embed_model(inputs=input_ids)
-            else:
-                doc_output = self.embed_model(**{k: mx.array(v) for k, v in doc_inputs.items()})
-            
-            if hasattr(doc_output, 'last_hidden_state'):
-                doc_embeddings = doc_output.last_hidden_state
-            elif hasattr(doc_output, 'pooler_output'):
-                doc_embeddings = doc_output.pooler_output
-            else:
-                doc_embeddings = doc_output[0] if isinstance(doc_output, tuple) else doc_output
-            
-            # Compute cosine similarities
-            scores = []
-            for i in range(len(documents)):
-                doc_emb = mx.mean(doc_embeddings[i], axis=0)
-                doc_emb = doc_emb / mx.linalg.norm(doc_emb)
-                # Normalized dot product (cosine similarity)
-                similarity = mx.sum(query_emb * doc_emb).item()
-                scores.append(float(similarity))
-            
+            doc_embs = self._embed_texts(doc_formatted)  # shape (N, dim), already normalized
+
+            # Cosine similarity = dot product (embeddings are already L2-normalized)
+            # query_emb: (1, dim), doc_embs: (N, dim) -> scores: (N,)
+            scores_mx = mx.sum(query_emb * doc_embs, axis=1)
+            scores = [float(s) for s in scores_mx.tolist()]
             # Create results with original indices
             results = [
                 {
@@ -326,10 +234,8 @@ class MLXBackend:
                 }
                 for i in range(len(documents))
             ]
-            
             # Sort by score descending
             results.sort(key=lambda x: x["score"], reverse=True)
-            
             return {
                 "success": True,
                 "results": results,
@@ -457,7 +363,7 @@ def main():
     logger.info("MLX Backend started, waiting for commands...")
     
     # Send ready signal
-    print(json.dumps({"ready": True}), flush=True)
+    print(_json_dumps({"ready": True}), flush=True)
     
     try:
         for line in sys.stdin:
@@ -473,7 +379,7 @@ def main():
                 response = backend.handle_command(command)
                 
                 # Send response
-                print(json.dumps(response), flush=True)
+                print(_json_dumps(response), flush=True)
                 
                 # Check for shutdown
                 if command.get("command") == "shutdown":
@@ -483,13 +389,13 @@ def main():
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON: {e}")
                 response = {"success": False, "error": f"Invalid JSON: {str(e)}"}
-                print(json.dumps(response), flush=True)
+                print(_json_dumps(response), flush=True)
             
             except Exception as e:
                 logger.error(f"Error handling command: {e}")
                 logger.error(traceback.format_exc())
                 response = {"success": False, "error": str(e)}
-                print(json.dumps(response), flush=True)
+                print(_json_dumps(response), flush=True)
     
     except KeyboardInterrupt:
         logger.info("Interrupted, exiting...")

@@ -1226,15 +1226,20 @@ export class LlamaMlx implements LLM {
   private retryCount = 0;
 
   constructor(config: LlamaMlxConfig = {}) {
-    this.pythonPath = config.pythonPath || "python3";
-    
     // Auto-detect backend script location (relative to this file)
+    // When built (dist/llm.js), __dirname is dist/, so go up one level to project root
+    // When in dev (src/llm.ts), __dirname is src/, also go up one level
+      const projectRoot = join(__dirname, "..");
+    // Auto-detect Python: prefer venv in project root, then system python3
+    if (config.pythonPath) {
+      this.pythonPath = config.pythonPath;
+    } else {
+      const venvPython = join(projectRoot, "venv", "bin", "python3");
+      this.pythonPath = existsSync(venvPython) ? venvPython : "python3";
+    }
     if (config.backendScript) {
       this.backendScript = config.backendScript;
     } else {
-      // When built (dist/llm.js), __dirname is dist/, so go up one level to project root
-      // When in dev (src/llm.ts), __dirname is src/, also go up one level
-      const projectRoot = join(__dirname, "..");
       this.backendScript = join(projectRoot, "mlx_backend.py");
     }
     
